@@ -1,0 +1,75 @@
+syntax = "proto3";
+option go_package = "pb/cniOffload";
+
+import "cniOffloadDefinitions.proto";
+
+/*
+CNIAddRequest gRPC service request to add an interface that is allcoated on the
+host pod to the DPU data path. The fields of the request are added to consider
+the following scenarios
+* Programable DPU data path
+* Stack based DPU data path
+* Interface is part of Secondary CNI network
+* Interface is used to offload Primary CNI to DPU
+*/
+message CNIAddRequest {
+  PodDetails podInfo = 1;
+  IntfDetails intfInfo = 2;
+  string mac_addr = 3;
+  IPAMallocatedbyHost ipamAllocatedbyHost =4;
+  IpDetails ipInfo = 5;
+  OffloadFlags offloadFlags=6;
+  string vlan = 7;
+}
+
+/*
+CNIAddResponse Response Message for Add
+*/
+message CNIAddResponse {
+ IpDetails ipInfo = 1;
+ string vlan = 2;
+ string status = 3;
+}
+
+/*
+CNIDelRequest Fields are added based on what is needed to cover the scenarios
+defined for CniAddRequest message
+*/
+message CNIDelRequest{
+  IntfDetails intfInfo =1;
+  PodDetails podInfo =2;
+}
+/*
+CNIDelResponse Response message for Del
+*/
+message CNIDelResponse{
+ IpDetails ipInfo=1;
+ string status = 2;
+}
+
+/*
+CNICheckResponse Response message for Check
+*/
+message CNICheckResponse{
+ IpDetails ipInfo=1;
+ string status = 2;
+}
+
+/*
+CNICheckRequest Fields are added based on what is needed to cover the scenarios
+defined for CniAddRequest message
+*/
+message CNICheckRequest{
+  IntfDetails intfInfo=1;
+  PodDetails podInfo=2;
+  IpDetails ipInfo=3;
+ }
+
+/*
+CNIAction Service Contains all the Api Function For the gRPC client server talk
+*/
+service CNIAction {
+      rpc cmdAdd(CNIAddRequest) returns (CNIAddResponse) {}
+      rpc cmdDel(CNIDelRequest) returns (CNIDelResponse) {}
+      rpc cmdCheck(CNICheckRequest)returns (CNICheckResponse){}
+}

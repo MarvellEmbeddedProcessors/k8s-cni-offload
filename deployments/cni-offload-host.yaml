@@ -1,0 +1,42 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: cni-offload-host
+  namespace: kube-system
+spec:
+  selector:
+    matchLabels:
+      app: cni-offload-host
+  template:
+    metadata:
+      labels:
+        app: cni-offload-host
+        component: network
+        type: infra
+    spec:
+      hostNetwork: true
+      hostPID: true
+      nodeSelector:
+        marvell.com/dpu: "true"
+      containers:
+        - name: cni-offload-host
+          image: {{.Repository}}/cni-offload-host
+          command: [ "/bin/bash", "-c", "--" ]
+          args: [ "/cni-setup.sh" ]
+          securityContext:
+            privileged: true
+          imagePullPolicy: Always 
+          volumeMounts:
+            - name: netconf-path
+              mountPath: /etc/cni/net.d/
+              mountPropagation: Bidirectional
+            - name: cni-path
+              mountPath: /opt/cni/bin/
+              mountPropagation: Bidirectional
+      volumes:
+        - name: netconf-path
+          hostPath:
+            path: /etc/cni/net.d/
+        - name: cni-path
+          hostPath:
+            path: /opt/cni/bin/

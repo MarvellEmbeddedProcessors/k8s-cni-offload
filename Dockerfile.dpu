@@ -1,0 +1,54 @@
+FROM ubuntu:20.04 AS builder
+
+RUN apt update -y
+
+RUN DEBIAN_FRONTEND=noninteractive \
+	apt install libtool autoconf curl tar texinfo gawk gcc g++ git make -y
+
+WORKDIR /workspace
+RUN mkdir -p /workspace/libconfig-bin/
+RUN mkdir -p /workspace/bin/
+
+RUN	 curl -OL -k https://github.com/hyperrealm/libconfig/archive/refs/tags/v1.7.2.tar.gz && \
+         tar -xzvf v1.7.2.tar.gz && cd libconfig-1.7.2 && autoreconf -i && ./configure --prefix=/workspace/libconfig-bin/ && \
+         make && make install && cd - && \
+         rm -fr /workspace/libconfig-1.7.2* ;
+
+WORKDIR /workspace
+RUN     git clone https://github.com/MarvellEmbeddedProcessors/pcie_ep_octeon_target.git && \
+        cd /workspace/pcie_ep_octeon_target/target/libs/octep_cp_lib && \
+        git checkout aa84a2331f76b68583e7b5861f17f5f3cef0fbd0 && \
+        export CFLAGS="$CFLAGS -Wno-error=unused-result -DUSE_PEM_AND_DPI_PF=1" && make ;
+
+WORKDIR "/workspace/pcie_ep_octeon_target/target/apps/octep_cp_agent"
+RUN     export OCTEP_PATH="/workspace/pcie_ep_octeon_target/target/libs/octep_cp_lib" && \
+        export CFLAGS="$CFLAGS -I$OCTEP_PATH/include -I/workspace/libconfig-bin/include" && \
+        export LDFLAGS="-L$OCTEP_PATH -L/workspace/libconfig-bin/lib" && \
+        make && \
+        cp bin/bin/octep_cp_agent /workspace/bin/ && \
+        cp cn106xx.cfg /workspace/bin/;
+
+FROM ubuntu:20.04
+
+RUN DEBIAN_FRONTEND=noninteractive \
+	apt update -y
+
+RUN mkdir -p /scripts
+RUN mkdir -p /scripts/bin
+RUN mkdir -p /scripts/libconfig-bin
+RUN mkdir -p /scripts/cp-agent
+
+COPY --from=builder /workspace/bin/ /scripts/bin/
+COPY --from=builder /workspace/libconfig-bin/ /scripts/libconfig-bin/
+COPY pkg/scripts/ /scripts/cp-agent
+
+COPY cmd/dpu/cniOffloadAgent/cniOffloadAgent /
+COPY cmd/dpu/cniOffloadAgent/cni-offload-config.yaml /
+COPY cmd/dpu/cniOffloadAgent/start-cniOffloadAgent.sh /
+COPY plugin/dpu/vendorplugins/marvell/marvell-config.yaml /
+RUN mkdir -p /etc/cni && mkdir -p /etc/cni/net.d
+RUN mkdir -p /opt/cni && mkdir -p /opt/cni/bin
+
+COPY build/cilium/plugins/cilium-offload-cni/23-cep.conf /etc/cni/net.d/
+COPY build/cilium/plugins/cilium-offload-cni/cilium-offload-cni /opt/cni/bin/
+RUN chmod +x /start-cniOffloadAgent.sh

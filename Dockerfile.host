@@ -1,0 +1,9 @@
+FROM ubuntu:20.04
+
+RUN mkdir -p /etc/cni && mkdir -p /etc/cni/net.d
+RUN mkdir -p /opt/cni && mkdir -p /opt/cni/bin
+
+COPY build/offload-cni/images/20-offload-cni.conf /
+COPY build/offload-cni/cmd/offload-cni/offload-cni /
+COPY deployments/cni-setup.sh /
+RUN chmod +x /cni-setup.sh

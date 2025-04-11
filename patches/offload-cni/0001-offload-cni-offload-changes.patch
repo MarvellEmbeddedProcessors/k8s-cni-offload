@@ -1,0 +1,839 @@
+From 498b7fda9b44ba9f6ce6740c6aa9d96f4f2f6c93 Mon Sep 17 00:00:00 2001
+From: Balakrishna Bhamidipati <bbhamidipati@marvell.com>
+Date: Thu, 22 May 2025 16:13:52 +0530
+Subject: [PATCH] offload-cni: offload changes
+
+
+diff --git a/Makefile b/Makefile
+index 2768e279..9cd2885e 100644
+--- a/Makefile
++++ b/Makefile
+@@ -3,7 +3,7 @@
+ #   This makefile was adapted from: https://github.com/vincentbernat/hellogopher/blob/feature/glide/Makefile
+ #
+ # Package related
+-BINARY_NAME=sriov
++BINARY_NAME=offload-cni
+ PACKAGE=sriov-cni
+ BINDIR=$(CURDIR)/bin
+ BUILDDIR=$(CURDIR)/build
+diff --git a/cmd/sriov/main.go b/cmd/offload-cni/main.go
+similarity index 57%
+rename from cmd/sriov/main.go
+rename to cmd/offload-cni/main.go
+index 1281fde3..26f87c0b 100644
+--- a/cmd/sriov/main.go
++++ b/cmd/offload-cni/main.go
+@@ -1,25 +1,40 @@
+ package main
+ 
+ import (
++	"context"
+ 	"errors"
+ 	"fmt"
++	"log"
++	"net"
++	"os"
+ 	"runtime"
+ 	"strings"
+ 	"time"
+ 
++	pb "github.com/MarvellEmbeddedProcessors/k8s-cni-offload/api/pb/cniOffload"
++
++	ciliumtypes "github.com/cilium/cilium/plugins/cilium-cni/types"
++	cniTypes "github.com/containernetworking/cni/pkg/types"
++
+ 	"github.com/containernetworking/cni/pkg/skel"
+ 	"github.com/containernetworking/cni/pkg/types"
+ 	current "github.com/containernetworking/cni/pkg/types/100"
+ 	"github.com/containernetworking/cni/pkg/version"
+ 	"github.com/containernetworking/plugins/pkg/ipam"
+ 	"github.com/containernetworking/plugins/pkg/ns"
+-	"github.com/k8snetworkplumbingwg/sriov-cni/pkg/config"
+-	"github.com/k8snetworkplumbingwg/sriov-cni/pkg/logging"
+-	"github.com/k8snetworkplumbingwg/sriov-cni/pkg/sriov"
+-	"github.com/k8snetworkplumbingwg/sriov-cni/pkg/utils"
++	"github.com/MarvellEmbeddedProcessors/k8s-cni-offload/build/offload-cni/pkg/config"
++	"github.com/MarvellEmbeddedProcessors/k8s-cni-offload/build/offload-cni/pkg/logging"
++	"github.com/MarvellEmbeddedProcessors/k8s-cni-offload/build/offload-cni/pkg/sriov"
++	sriovtypes "github.com/MarvellEmbeddedProcessors/k8s-cni-offload/build/offload-cni/pkg/types"
++	"github.com/MarvellEmbeddedProcessors/k8s-cni-offload/build/offload-cni/pkg/utils"
+ 	"github.com/vishvananda/netlink"
++	"google.golang.org/grpc"
++	"google.golang.org/grpc/credentials/insecure"
+ )
+ 
++var client pb.CNIActionClient
++var hostIPAM bool
++
+ type envArgs struct {
+ 	types.CommonArgs
+ 	MAC types.UnmarshallableString `json:"mac,omitempty"`
+@@ -44,7 +59,107 @@ func getEnvArgs(envArgsString string) (*envArgs, error) {
+ 	return nil, nil
+ }
+ 
++func SendCniOffloadAdd(args *skel.CmdArgs, cniArgs *ciliumtypes.ArgsSpec, netConf *sriovtypes.NetConf, macaddr string) (*pb.CNIAddResponse, error) {
++	addReq := &pb.CNIAddRequest{
++		PodInfo: &pb.PodDetails{
++			PodNamespace: string(cniArgs.K8S_POD_NAMESPACE),
++			PodName:      string(cniArgs.K8S_POD_NAME),
++			ContainerId:  string(args.ContainerID),
++		},
++		IntfInfo: &pb.IntfDetails{
++			Vfid:   uint32(netConf.VFID),
++			Pfid:   uint32(netConf.PFID),
++			NumPfs: uint32(netConf.NumPFs),
++		},
++		MacAddr: strings.ToLower(macaddr),
++		IpamAllocatedbyHost: &pb.IPAMallocatedbyHost{
++			IpamAllocatedbyHost: netConf.HostIPAM,
++		},
++		OffloadFlags: &pb.OffloadFlags{
++			CheckSumOffload: false,
++		},
++	}
++
++	logging.Debug("SendCniOffloadAdd():", "addReq:", addReq)
++	//Send gRPC request
++	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(time.Duration(5)*time.Second))
++	defer cancel()
++	return client.CmdAdd(ctx, addReq)
++}
++
++// release DPU side VF
++func SendCniOffloadDel(args *skel.CmdArgs, cniArgs *ciliumtypes.ArgsSpec, netConf *sriovtypes.NetConf) {
++	DelReq := &pb.CNIDelRequest{
++		PodInfo: &pb.PodDetails{
++			PodNamespace: string(cniArgs.K8S_POD_NAMESPACE),
++			PodName:      string(cniArgs.K8S_POD_NAME),
++			ContainerId:  string(args.ContainerID),
++		},
++		IntfInfo: &pb.IntfDetails{
++			Vfid:   uint32(netConf.VFID),
++			Pfid:   0,
++			NumPfs: 1,
++		},
++	}
++
++	//Send gRPC request
++	logging.Debug("SendCniOffloadDel():", "DelReq", DelReq)
++	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(time.Duration(5)*time.Second))
++	defer cancel()
++	_, _ = client.CmdDel(ctx, DelReq)
++}
++
++func routeAdd(routes []*types.Route, link netlink.Link, ifName string) error {
++	for i, r := range routes {
++		logging.Debug("Adding route", "r", r)
++		var rt *netlink.Route
++		if i == 0 {
++			rt = &netlink.Route{
++				LinkIndex: link.Attrs().Index,
++				Scope:     netlink.SCOPE_LINK,
++				Dst:       &r.Dst,
++			}
++		} else {
++			rt = &netlink.Route{
++				LinkIndex: link.Attrs().Index,
++				Dst:       &r.Dst,
++				MTU:       1450,
++				Gw:        r.GW,
++			}
++		}
++
++		if err := netlink.RouteAdd(rt); err != nil {
++			if !os.IsExist(err) {
++				logging.Debug("failed to add route", "err", err)
++				return fmt.Errorf("failed to add route '%v via %v dev %v': %w",
++					r.Dst, r.GW, ifName, err)
++			}
++		}
++	}
++
++	return nil
++}
++
++// IPv4Routes returns IPv4 routes to be installed in endpoint's networking namespace.
++func IPv4Routes(ip net.IP) []*types.Route {
++	return []*types.Route{
++		{
++			Dst: net.IPNet{
++				IP:   ip,
++				Mask: net.CIDRMask(32, 32),
++			},
++		},
++		{
++			Dst: net.IPNet{IP: net.IPv4zero, Mask: net.CIDRMask(0, 32)},
++			GW:  ip,
++		},
++	}
++}
++
+ func cmdAdd(args *skel.CmdArgs) error {
++	if args.IfName != "eth0" {
++		return nil
++	}
+ 	if err := config.SetLogging(args.StdinData, args.ContainerID, args.Netns, args.IfName); err != nil {
+ 		return err
+ 	}
+@@ -57,6 +172,31 @@ func cmdAdd(args *skel.CmdArgs) error {
+ 		return fmt.Errorf("SRIOV-CNI failed to load netconf: %v", err)
+ 	}
+ 
++	// Mark the pci address as in use.
++	logging.Debug("Mark the PCI address as in use",
++		"func", "cmdAdd",
++		"config.DefaultCNIDir", config.DefaultCNIDir,
++		"netConf.DeviceID", netConf.DeviceID)
++	allocator := utils.NewPCIAllocator(config.DefaultCNIDir)
++	if err = allocator.SaveAllocatedPCI(netConf.DeviceID, args.Netns); err != nil {
++		return fmt.Errorf("error saving the pci allocation for vf pci address %s: %v", netConf.DeviceID, err)
++	}
++
++	defer func() {
++		if err != nil {
++			// In case of errors, mark the pci address as released
++			logging.Debug("Mark the PCI address as released",
++				"func", "cmdAdd",
++				"config.DefaultCNIDir", config.DefaultCNIDir,
++				"netConf.DeviceID", netConf.DeviceID)
++			allocator := utils.NewPCIAllocator(config.DefaultCNIDir)
++			if err = allocator.DeleteAllocatedPCI(netConf.DeviceID); err != nil {
++				logging.Error("cmdAdd: error cleaning the pci allocation for vf pci address %s: %v",
++							netConf.DeviceID, err)
++			}
++		}
++	}()
++
+ 	envArgs, err := getEnvArgs(args.Args)
+ 	if err != nil {
+ 		return fmt.Errorf("SRIOV-CNI failed to parse args: %v", err)
+@@ -79,6 +219,29 @@ func cmdAdd(args *skel.CmdArgs) error {
+ 	// Always use lower case for mac address
+ 	netConf.MAC = strings.ToLower(netConf.MAC)
+ 
++	cniArgs := &ciliumtypes.ArgsSpec{}
++	if err = cniTypes.LoadArgs(args.Args, cniArgs); err != nil {
++		return fmt.Errorf("unable to extract CNI arguments: %w", err)
++	}
++
++	LinkName := utils.LinknameByPci(netConf.DeviceID)
++
++	link, _ := netlink.LinkByName(LinkName)
++
++	mac := link.Attrs().HardwareAddr
++
++	//gRPC cli
++	CNIAddRespOut, err := SendCniOffloadAdd(args, cniArgs, netConf, mac.String())
++	if err != nil {
++		return fmt.Errorf("Error in CNIAddRequest:%v", err)
++	}
++
++	defer func() {
++		if err != nil {
++			SendCniOffloadDel(args, cniArgs, netConf)
++		}
++	}()
++
+ 	netns, err := ns.GetNS(args.Netns)
+ 	if err != nil {
+ 		return fmt.Errorf("failed to open netns %q: %v", netns, err)
+@@ -115,7 +278,6 @@ func cmdAdd(args *skel.CmdArgs) error {
+ 
+ 	if !netConf.DPDKMode {
+ 		err = sm.SetupVF(netConf, args.IfName, netns)
+-
+ 		if err != nil {
+ 			return fmt.Errorf("failed to set up pod interface %q from the device %q: %v", args.IfName, netConf.Master, err)
+ 		}
+@@ -174,6 +336,71 @@ func cmdAdd(args *skel.CmdArgs) error {
+ 		result = newResult
+ 	}
+ 
++	hostIPAM = netConf.HostIPAM
++	if !hostIPAM {
++		ip, ipNet, err := net.ParseCIDR(CNIAddRespOut.IpInfo.Address + "/32")
++		if err != nil {
++			return fmt.Errorf("failed to parse IP address: %v", err)
++		}
++
++		ipNet.IP = ip
++		ipConfig := &current.IPConfig{
++			Interface: current.Int(0),
++			Address:   *ipNet,
++		}
++		result.IPs = append(result.IPs, ipConfig)
++		if !netConf.DPDKMode {
++			err = netns.Do(func(_ ns.NetNS) error {
++				err := ipam.ConfigureIface(args.IfName, result)
++				if err != nil {
++					return err
++				}
++
++				_ = utils.AnnounceIPs(args.IfName, result.IPs)
++				return nil
++			})
++
++			if err != nil {
++				return err
++			}
++		}
++
++		/*
++		   Fill below routes:
++		   ip r add 10.0.2.148  dev eth0 scope link
++		   ip r add default via 10.0.2.148  dev eth0 mtu 1450
++		*/
++		logging.Debug("route", "netns", args.Netns)
++		if !netConf.DPDKMode {
++			err = netns.Do(func(_ ns.NetNS) error {
++				link, err := netlink.LinkByName(args.IfName)
++				if err != nil {
++					logging.Debug("%s: No such interface", args.IfName)
++				}
++				ipGW := net.ParseIP(CNIAddRespOut.IpInfo.Gateway)
++				routes := IPv4Routes(ipGW)
++				err = routeAdd(routes, link, args.IfName)
++				if err != nil {
++					logging.Debug("%s: No such interface", args.IfName)
++					return err
++				}
++
++				result.Routes = routes
++				return nil
++			})
++
++			if err != nil {
++				_, err := netlink.LinkByName(args.IfName)
++				if err == nil {
++					_ = sm.ReleaseVF(netConf, args.IfName, netns)
++				}
++				// Reset the VF if failure occurs before the netconf is cached
++				_ = sm.ResetVFConfig(netConf)
++				return err
++			}
++		}
++	}
++
+ 	// Cache NetConf for CmdDel
+ 	logging.Debug("Cache NetConf for CmdDel",
+ 		"func", "cmdAdd",
+@@ -183,16 +410,6 @@ func cmdAdd(args *skel.CmdArgs) error {
+ 		return fmt.Errorf("error saving NetConf %q", err)
+ 	}
+ 
+-	// Mark the pci address as in use.
+-	logging.Debug("Mark the PCI address as in use",
+-		"func", "cmdAdd",
+-		"config.DefaultCNIDir", config.DefaultCNIDir,
+-		"netConf.DeviceID", netConf.DeviceID)
+-	allocator := utils.NewPCIAllocator(config.DefaultCNIDir)
+-	if err = allocator.SaveAllocatedPCI(netConf.DeviceID, args.Netns); err != nil {
+-		return fmt.Errorf("error saving the pci allocation for vf pci address %s: %v", netConf.DeviceID, err)
+-	}
+-
+ 	if doAnnounce {
+ 		_ = netns.Do(func(_ ns.NetNS) error {
+ 			/* After IPAM configuration is done, the following needs to handle the case of an IP address being reused by a different pods.
+@@ -268,6 +485,13 @@ func cmdDel(args *skel.CmdArgs) error {
+ 		return fmt.Errorf("cmdDel() error obtaining VF ID: %q", err)
+ 	}
+ 
++	cniArgs := &ciliumtypes.ArgsSpec{}
++	if err = cniTypes.LoadArgs(args.Args, cniArgs); err != nil {
++		return fmt.Errorf("unable to extract CNI arguments: %w", err)
++	}
++
++	SendCniOffloadDel(args, cniArgs, netConf)
++
+ 	sm := sriov.NewSriovManager()
+ 
+ 	/* ResetVFConfig resets a VF administratively. We must run ResetVFConfig
+@@ -313,15 +537,53 @@ func cmdDel(args *skel.CmdArgs) error {
+ 	return nil
+ }
+ 
+-func cmdCheck(_ *skel.CmdArgs) error {
++func cmdCheck(args *skel.CmdArgs) error {
++	cniArgs := &ciliumtypes.ArgsSpec{}
++	if err := cniTypes.LoadArgs(args.Args, cniArgs); err != nil {
++		return fmt.Errorf("unable to extract CNI arguments: %w", err)
++	}
++
++	netConf, err := config.LoadConf(args.StdinData)
++	if err != nil {
++		return fmt.Errorf("SRIOV-CNI failed to load netconf: %v", err)
++	}
++
++	checkReq := &pb.CNICheckRequest{
++		PodInfo: &pb.PodDetails{
++			PodNamespace: string(cniArgs.K8S_POD_NAMESPACE),
++			PodName:      string(cniArgs.K8S_POD_NAME),
++			ContainerId:  string(args.ContainerID),
++		},
++		IntfInfo: &pb.IntfDetails{
++			Vfid:   uint32(netConf.VFID),
++			Pfid:   uint32(netConf.PFID),
++			NumPfs: uint32(netConf.NumPFs),
++		},
++	}
++	_, err = client.CmdCheck(context.Background(), checkReq)
++	if err != nil {
++		log.Fatalf("\nError in CNICheckRequest:%v\n", err)
++	}
++	//log.Printf("The Output of CNICheckRequst is :%v\n", CNICheckRespOut)
+ 	return nil
+ }
+ 
+ func main() {
++	serverAddress := "192.168.1.1:8000"
++	conn, err := grpc.NewClient(serverAddress,
++		grpc.WithTransportCredentials(insecure.NewCredentials()))
++	if err != nil {
++		log.Fatalf("failed to connect: %v", err)
++	}
++
++	defer conn.Close()
++	client = pb.NewCNIActionClient(conn)
++
+ 	cniFuncs := skel.CNIFuncs{
+ 		Add:   cmdAdd,
+-		Del:   cmdDel,
+ 		Check: cmdCheck,
++		Del:   cmdDel,
+ 	}
++
+ 	skel.PluginMainFuncs(cniFuncs, version.All, "")
+ }
+diff --git a/go.mod b/go.mod
+deleted file mode 100644
+index 4e4bab39..00000000
+--- a/go.mod
++++ /dev/null
+@@ -1,39 +0,0 @@
+-module github.com/k8snetworkplumbingwg/sriov-cni
+-
+-go 1.22.4
+-
+-require (
+-	github.com/containernetworking/cni v1.2.0-rc0.0.20240317203738-a448e71e9867
+-	github.com/containernetworking/plugins v1.4.2-0.20240312120516-c860b78de419
+-	github.com/k8snetworkplumbingwg/cni-log v0.0.0-20230801160229-b6e062c9e0f2
+-	github.com/onsi/ginkgo/v2 v2.16.0
+-	github.com/onsi/gomega v1.31.1
+-	github.com/stretchr/testify v1.8.2
+-	github.com/vishvananda/netlink v1.2.1-beta.2.0.20240221172127-ec7bcb248e94
+-	golang.org/x/net v0.23.0
+-	golang.org/x/sys v0.18.0
+-)
+-
+-require (
+-	github.com/coreos/go-iptables v0.7.0 // indirect
+-	github.com/davecgh/go-spew v1.1.1 // indirect
+-	github.com/go-logr/logr v1.4.1 // indirect
+-	github.com/go-task/slim-sprig v0.0.0-20230315185526-52ccab3ef572 // indirect
+-	github.com/google/go-cmp v0.6.0 // indirect
+-	github.com/google/pprof v0.0.0-20230323073829-e72429f035bd // indirect
+-	github.com/pmezard/go-difflib v1.0.0 // indirect
+-	github.com/safchain/ethtool v0.3.0 // indirect
+-	github.com/stretchr/objx v0.5.0 // indirect
+-	github.com/vishvananda/netns v0.0.4 // indirect
+-	golang.org/x/text v0.14.0 // indirect
+-	golang.org/x/tools v0.17.0 // indirect
+-	gopkg.in/natefinch/lumberjack.v2 v2.0.0 // indirect
+-	gopkg.in/yaml.v2 v2.4.0 // indirect
+-	gopkg.in/yaml.v3 v3.0.1 // indirect
+-)
+-
+-replace (
+-	github.com/onsi/ginkgo/v2 => github.com/onsi/ginkgo/v2 v2.9.2
+-	github.com/onsi/gomega => github.com/onsi/gomega v1.27.5
+-	github.com/vishvananda/netlink => github.com/vishvananda/netlink v1.2.1-beta.2.0.20240806173335-3b7e16c5f836
+-)
+diff --git a/go.sum b/go.sum
+deleted file mode 100644
+index ce8a5b32..00000000
+--- a/go.sum
++++ /dev/null
+@@ -1,66 +0,0 @@
+-github.com/BurntSushi/toml v1.1.0 h1:ksErzDEI1khOiGPgpwuI7x2ebx/uXQNw7xJpn9Eq1+I=
+-github.com/BurntSushi/toml v1.1.0/go.mod h1:CxXYINrC8qIiEnFrOxCa7Jy5BFHlXnUU2pbicEuybxQ=
+-github.com/containernetworking/cni v1.2.0-rc0.0.20240317203738-a448e71e9867 h1:DQ9iOvlXFOn+sJfbdvXyGISf/4xHNFGxJltq4mixK00=
+-github.com/containernetworking/cni v1.2.0-rc0.0.20240317203738-a448e71e9867/go.mod h1:Lt0TQcZQVDju64fYxUhDziTgXCDe3Olzi9I4zZJLWHg=
+-github.com/containernetworking/plugins v1.4.2-0.20240312120516-c860b78de419 h1:mvCb6RL9/tZwgXnkYNQQk6JDtLgHdtFde8uVm7VKg04=
+-github.com/containernetworking/plugins v1.4.2-0.20240312120516-c860b78de419/go.mod h1:n6FFGKcaY4o2o5msgu/UImtoC+fpQXM3076VHfHbj60=
+-github.com/coreos/go-iptables v0.7.0 h1:XWM3V+MPRr5/q51NuWSgU0fqMad64Zyxs8ZUoMsamr8=
+-github.com/coreos/go-iptables v0.7.0/go.mod h1:Qe8Bv2Xik5FyTXwgIbLAnv2sWSBmvWdFETJConOQ//Q=
+-github.com/davecgh/go-spew v1.1.0/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
+-github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
+-github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
+-github.com/go-logr/logr v1.4.1 h1:pKouT5E8xu9zeFC39JXRDukb6JFQPXM5p5I91188VAQ=
+-github.com/go-logr/logr v1.4.1/go.mod h1:9T104GzyrTigFIr8wt5mBrctHMim0Nb2HLGrmQ40KvY=
+-github.com/go-task/slim-sprig v0.0.0-20230315185526-52ccab3ef572 h1:tfuBGBXKqDEevZMzYi5KSi8KkcZtzBcTgAUUtapy0OI=
+-github.com/go-task/slim-sprig v0.0.0-20230315185526-52ccab3ef572/go.mod h1:9Pwr4B2jHnOSGXyyzV8ROjYa2ojvAY6HCGYYfMoC3Ls=
+-github.com/golang/protobuf v1.5.3 h1:KhyjKVUg7Usr/dYsdSqoFveMYd5ko72D+zANwlG1mmg=
+-github.com/golang/protobuf v1.5.3/go.mod h1:XVQd3VNwM+JqD3oG2Ue2ip4fOMUkwXdXDdiuN0vRsmY=
+-github.com/google/go-cmp v0.6.0 h1:ofyhxvXcZhMsU5ulbFiLKl/XBFqE1GSq7atu8tAmTRI=
+-github.com/google/go-cmp v0.6.0/go.mod h1:17dUlkBOakJ0+DkrSSNjCkIjxS6bF9zb3elmeNGIjoY=
+-github.com/google/pprof v0.0.0-20230323073829-e72429f035bd h1:r8yyd+DJDmsUhGrRBxH5Pj7KeFK5l+Y3FsgT8keqKtk=
+-github.com/google/pprof v0.0.0-20230323073829-e72429f035bd/go.mod h1:79YE0hCXdHag9sBkw2o+N/YnZtTkXi0UT9Nnixa5eYk=
+-github.com/k8snetworkplumbingwg/cni-log v0.0.0-20230801160229-b6e062c9e0f2 h1:KB8UPZQwLge4Abuk9tNmvzffdCJgqXSN341BX98QTHg=
+-github.com/k8snetworkplumbingwg/cni-log v0.0.0-20230801160229-b6e062c9e0f2/go.mod h1:/x45AlZDoJVSSV4ECDb5TcHLzrVRDllsCMDzMrtHKwk=
+-github.com/onsi/ginkgo/v2 v2.9.2 h1:BA2GMJOtfGAfagzYtrAlufIP0lq6QERkFmHLMLPwFSU=
+-github.com/onsi/ginkgo/v2 v2.9.2/go.mod h1:WHcJJG2dIlcCqVfBAwUCrJxSPFb6v4azBwgxeMeDuts=
+-github.com/onsi/gomega v1.27.5 h1:T/X6I0RNFw/kTqgfkZPcQ5KU6vCnWNBGdtrIx2dpGeQ=
+-github.com/onsi/gomega v1.27.5/go.mod h1:PIQNjfQwkP3aQAH7lf7j87O/5FiNr+ZR8+ipb+qQlhg=
+-github.com/pmezard/go-difflib v1.0.0 h1:4DBwDE0NGyQoBHbLQYPwSUPoCMWR5BEzIk/f1lZbAQM=
+-github.com/pmezard/go-difflib v1.0.0/go.mod h1:iKH77koFhYxTK1pcRnkKkqfTogsbg7gZNVY4sRDYZ/4=
+-github.com/safchain/ethtool v0.3.0 h1:gimQJpsI6sc1yIqP/y8GYgiXn/NjgvpM0RNoWLVVmP0=
+-github.com/safchain/ethtool v0.3.0/go.mod h1:SA9BwrgyAqNo7M+uaL6IYbxpm5wk3L7Mm6ocLW+CJUs=
+-github.com/stretchr/objx v0.1.0/go.mod h1:HFkY916IF+rwdDfMAkV7OtwuqBVzrE8GR6GFx+wExME=
+-github.com/stretchr/objx v0.4.0/go.mod h1:YvHI0jy2hoMjB+UWwv71VJQ9isScKT/TqJzVSSt89Yw=
+-github.com/stretchr/objx v0.5.0 h1:1zr/of2m5FGMsad5YfcqgdqdWrIhu+EBEJRhR1U7z/c=
+-github.com/stretchr/objx v0.5.0/go.mod h1:Yh+to48EsGEfYuaHDzXPcE3xhTkx73EhmCGUpEOglKo=
+-github.com/stretchr/testify v1.6.1/go.mod h1:6Fq8oRcR53rry900zMqJjRRixrwX3KX962/h/Wwjteg=
+-github.com/stretchr/testify v1.7.1/go.mod h1:6Fq8oRcR53rry900zMqJjRRixrwX3KX962/h/Wwjteg=
+-github.com/stretchr/testify v1.8.0/go.mod h1:yNjHg4UonilssWZ8iaSj1OCr/vHnekPRkoO+kdMU+MU=
+-github.com/stretchr/testify v1.8.2 h1:+h33VjcLVPDHtOdpUCuF+7gSuG3yGIftsP1YvFihtJ8=
+-github.com/stretchr/testify v1.8.2/go.mod h1:w2LPCIKwWwSfY2zedu0+kehJoqGctiVI29o6fzry7u4=
+-github.com/vishvananda/netlink v1.2.1-beta.2.0.20240806173335-3b7e16c5f836 h1:Cm3EYj6WpyJrgQydxfIHSS+1OEvro29a2XPR5m3PEDU=
+-github.com/vishvananda/netlink v1.2.1-beta.2.0.20240806173335-3b7e16c5f836/go.mod h1:i6NetklAujEcC6fK0JPjT8qSwWyO0HLn4UKG+hGqeJs=
+-github.com/vishvananda/netns v0.0.4 h1:Oeaw1EM2JMxD51g9uhtC0D7erkIjgmj8+JZc26m1YX8=
+-github.com/vishvananda/netns v0.0.4/go.mod h1:SpkAiCQRtJ6TvvxPnOSyH3BMl6unz3xZlaprSwhNNJM=
+-golang.org/x/net v0.23.0 h1:7EYJ93RZ9vYSZAIb2x3lnuvqO5zneoD6IvWjuhfxjTs=
+-golang.org/x/net v0.23.0/go.mod h1:JKghWKKOSdJwpW2GEx0Ja7fmaKnMsbu+MWVZTokSYmg=
+-golang.org/x/sys v0.2.0/go.mod h1:oPkhp1MJrh7nUepCBck5+mAzfO9JrbApNNgaTdGDITg=
+-golang.org/x/sys v0.6.0/go.mod h1:oPkhp1MJrh7nUepCBck5+mAzfO9JrbApNNgaTdGDITg=
+-golang.org/x/sys v0.10.0/go.mod h1:oPkhp1MJrh7nUepCBck5+mAzfO9JrbApNNgaTdGDITg=
+-golang.org/x/sys v0.18.0 h1:DBdB3niSjOA/O0blCZBqDefyWNYveAYMNF1Wum0DYQ4=
+-golang.org/x/sys v0.18.0/go.mod h1:/VUhepiaJMQUp4+oa/7Zr1D23ma6VTLIYjOOTFZPUcA=
+-golang.org/x/text v0.14.0 h1:ScX5w1eTa3QqT8oi6+ziP7dTV1S2+ALU0bI+0zXKWiQ=
+-golang.org/x/text v0.14.0/go.mod h1:18ZOQIKpY8NJVqYksKHtTdi31H5itFRjB5/qKTNYzSU=
+-golang.org/x/tools v0.17.0 h1:FvmRgNOcs3kOa+T20R1uhfP9F6HgG2mfxDv1vrx1Htc=
+-golang.org/x/tools v0.17.0/go.mod h1:xsh6VxdV005rRVaS6SSAf9oiAqljS7UZUacMZ8Bnsps=
+-google.golang.org/protobuf v1.32.0 h1:pPC6BG5ex8PDFnkbrGU3EixyhKcQ2aDuBS36lqK/C7I=
+-google.golang.org/protobuf v1.32.0/go.mod h1:c6P6GXX6sHbq/GpV6MGZEdwhWPcYBgnhAHhKbcUYpos=
+-gopkg.in/check.v1 v0.0.0-20161208181325-20d25e280405 h1:yhCVgyC4o1eVCa2tZl7eS0r+SDo693bJlVdllGtEeKM=
+-gopkg.in/check.v1 v0.0.0-20161208181325-20d25e280405/go.mod h1:Co6ibVJAznAaIkqp8huTwlJQCZ016jof/cbN4VW5Yz0=
+-gopkg.in/natefinch/lumberjack.v2 v2.0.0 h1:1Lc07Kr7qY4U2YPouBjpCLxpiyxIVoxqXgkXLknAOE8=
+-gopkg.in/natefinch/lumberjack.v2 v2.0.0/go.mod h1:l0ndWWf7gzL7RNwBG7wST/UCcT4T24xpD6X8LsfU/+k=
+-gopkg.in/yaml.v2 v2.4.0 h1:D8xgwECY7CYvx+Y2n4sBz93Jn9JRvxdiyyo8CTfuKaY=
+-gopkg.in/yaml.v2 v2.4.0/go.mod h1:RDklbk79AGWmwhnvt/jBztapEOGDOx6ZbXqjP6csGnQ=
+-gopkg.in/yaml.v3 v3.0.0-20200313102051-9f266ea9e77c/go.mod h1:K4uyk7z7BCEPqu6E+C64Yfv1cQ7kz7rIZviUmN+EgEM=
+-gopkg.in/yaml.v3 v3.0.1 h1:fxVm/GzAzEWqLHuvctI91KS9hhNmmWOoWu0XTYJS7CA=
+-gopkg.in/yaml.v3 v3.0.1/go.mod h1:K4uyk7z7BCEPqu6E+C64Yfv1cQ7kz7rIZviUmN+EgEM=
+diff --git a/images/20-offload-cni.conf b/images/20-offload-cni.conf
+new file mode 100644
+index 00000000..94661b94
+--- /dev/null
++++ b/images/20-offload-cni.conf
+@@ -0,0 +1,15 @@
++
++{
++  "cniVersion": "0.3.1",
++  "type": "offload-cni",
++  "name": "offload-cni-network",
++  "vendorID": "177d",
++  "productID": "b903",
++  "hostIPAM": false,
++  "debug": true,
++  "logLevel": "debug",
++  "logFile": "/tmp/offload-cni.log"
++}
++
++
++
+diff --git a/pkg/config/config.go b/pkg/config/config.go
+index e15fa382..91855e36 100644
+--- a/pkg/config/config.go
++++ b/pkg/config/config.go
+@@ -4,17 +4,22 @@ import (
+ 	"encoding/json"
+ 	"fmt"
+ 	"path/filepath"
++
++	"errors"
++	ghw "github.com/jaypipes/ghw"
+ 	"strings"
+ 
++	"github.com/MarvellEmbeddedProcessors/k8s-cni-offload/build/offload-cni/pkg/logging"
++	sriovtypes "github.com/MarvellEmbeddedProcessors/k8s-cni-offload/build/offload-cni/pkg/types"
++	"github.com/MarvellEmbeddedProcessors/k8s-cni-offload/build/offload-cni/pkg/utils"
+ 	"github.com/containernetworking/cni/pkg/skel"
+-	"github.com/k8snetworkplumbingwg/sriov-cni/pkg/logging"
+-	sriovtypes "github.com/k8snetworkplumbingwg/sriov-cni/pkg/types"
+-	"github.com/k8snetworkplumbingwg/sriov-cni/pkg/utils"
+ )
+ 
+ var (
+ 	// DefaultCNIDir used for caching NetConf
+ 	DefaultCNIDir = "/var/lib/cni/sriov"
++	NumPFs        = 1
++	PFID          = 0
+ )
+ 
+ // SetLogging sets global logging parameters.
+@@ -28,6 +33,47 @@ func SetLogging(stdinData []byte, containerID, netns, ifName string) error {
+ 	return nil
+ }
+ 
++// AllocPrimaryVF allocates VF, if DeviceID is empty
++func AllocPrimaryVF(VendorID string, DevID string) (string, error) {
++	/*
++		Cavium, Inc. vendor id: 177d
++		Ethernet Controller device id: b903 for 106
++	*/
++
++	pci, err := ghw.PCI()
++	if err != nil {
++		return "", err
++	}
++
++	devices := pci.Devices
++	var list []string
++	for _, device := range devices {
++		if device.Vendor != nil && device.Product != nil {
++			if device.Vendor.ID == VendorID &&
++				device.Product.ID == DevID {
++				list = append(list, device.Address)
++			}
++		}
++	}
++
++	for _, addr := range list {
++		allocator := utils.NewPCIAllocator(DefaultCNIDir)
++		isAllocated, err := allocator.IsAllocated(addr)
++		if err != nil {
++			return "", err
++		}
++
++		if isAllocated {
++			continue
++		}
++
++		logging.Debug("Found free VF", "addr", addr)
++		return addr, nil
++	}
++
++	return "", errors.New("No free VF found")
++}
++
+ // LoadConf parses and validates stdin netconf and returns NetConf object
+ func LoadConf(bytes []byte) (*sriovtypes.NetConf, error) {
+ 	n := &sriovtypes.NetConf{}
+@@ -35,19 +81,27 @@ func LoadConf(bytes []byte) (*sriovtypes.NetConf, error) {
+ 		return nil, fmt.Errorf("LoadConf(): failed to load netconf: %v", err)
+ 	}
+ 
+-	// DeviceID takes precedence; if we are given a VF pciaddr then work from there
+-	if n.DeviceID != "" {
+-		// Get rest of the VF information
+-		pfName, vfID, err := getVfInfo(n.DeviceID)
++	if n.DeviceID == "" {
++		// CNI Offload: As this is primary CNI, DeviceID is not set. So, allocate one.
++		addr, err := AllocPrimaryVF(n.VendorID, n.ProductID)
+ 		if err != nil {
+-			return nil, fmt.Errorf("LoadConf(): failed to get VF information: %q", err)
++			return nil, err
+ 		}
+-		n.VFID = vfID
+-		n.Master = pfName
+-	} else {
+-		return nil, fmt.Errorf("LoadConf(): VF pci addr is required")
++
++		n.DeviceID = addr
+ 	}
+ 
++	// Get rest of the VF information
++	pfName, vfID, err := getVfInfo(n.DeviceID)
++	if err != nil {
++		return nil, fmt.Errorf("LoadConf(): failed to get VF information: %q", err)
++	}
++
++	n.VFID = vfID
++	n.PFID = PFID
++	n.NumPFs = NumPFs
++	n.Master = pfName
++
+ 	// Check if the device is already allocated.
+ 	// This is to prevent issues where kubelet request to delete a pod and in the same time a new pod using the same
+ 	// vf is started. we can have an issue where the cmdDel of the old pod is called AFTER the cmdAdd of the new one
+diff --git a/pkg/config/config_suite_test.go b/pkg/config/config_suite_test.go
+index 25060295..ea7d0903 100644
+--- a/pkg/config/config_suite_test.go
++++ b/pkg/config/config_suite_test.go
+@@ -3,7 +3,7 @@ package config
+ import (
+ 	"testing"
+ 
+-	"github.com/k8snetworkplumbingwg/sriov-cni/pkg/utils"
++	"github.com/MarvellEmbeddedProcessors/k8s-cni-offload/build/offload-cni/pkg/utils"
+ 	. "github.com/onsi/ginkgo/v2"
+ 	. "github.com/onsi/gomega"
+ )
+diff --git a/pkg/config/config_test.go b/pkg/config/config_test.go
+index fe7b8142..fc22df95 100644
+--- a/pkg/config/config_test.go
++++ b/pkg/config/config_test.go
+@@ -8,8 +8,8 @@ import (
+ 	. "github.com/onsi/ginkgo/v2"
+ 	. "github.com/onsi/gomega"
+ 
+-	"github.com/k8snetworkplumbingwg/sriov-cni/pkg/types"
+-	"github.com/k8snetworkplumbingwg/sriov-cni/pkg/utils"
++	"github.com/MarvellEmbeddedProcessors/k8s-cni-offload/build/offload-cni/pkg/types"
++	"github.com/MarvellEmbeddedProcessors/k8s-cni-offload/build/offload-cni/pkg/utils"
+ )
+ 
+ var _ = Describe("Config", func() {
+diff --git a/pkg/sriov/sriov.go b/pkg/sriov/sriov.go
+index f5c57970..832a7425 100644
+--- a/pkg/sriov/sriov.go
++++ b/pkg/sriov/sriov.go
+@@ -5,9 +5,9 @@ import (
+ 
+ 	"github.com/containernetworking/plugins/pkg/ns"
+ 
+-	"github.com/k8snetworkplumbingwg/sriov-cni/pkg/logging"
+-	sriovtypes "github.com/k8snetworkplumbingwg/sriov-cni/pkg/types"
+-	"github.com/k8snetworkplumbingwg/sriov-cni/pkg/utils"
++	"github.com/MarvellEmbeddedProcessors/k8s-cni-offload/build/offload-cni/pkg/logging"
++	sriovtypes "github.com/MarvellEmbeddedProcessors/k8s-cni-offload/build/offload-cni/pkg/types"
++	"github.com/MarvellEmbeddedProcessors/k8s-cni-offload/build/offload-cni/pkg/utils"
+ 	"github.com/vishvananda/netlink"
+ )
+ 
+diff --git a/pkg/sriov/sriov_suite_test.go b/pkg/sriov/sriov_suite_test.go
+index 4ee20377..e5749db8 100644
+--- a/pkg/sriov/sriov_suite_test.go
++++ b/pkg/sriov/sriov_suite_test.go
+@@ -6,7 +6,7 @@ import (
+ 
+ 	"testing"
+ 
+-	"github.com/k8snetworkplumbingwg/sriov-cni/pkg/utils"
++	"github.com/MarvellEmbeddedProcessors/k8s-cni-offload/build/offload-cni/pkg/utils"
+ )
+ 
+ func TestConfig(t *testing.T) {
+diff --git a/pkg/sriov/sriov_test.go b/pkg/sriov/sriov_test.go
+index fdd6497b..306ea9d5 100644
+--- a/pkg/sriov/sriov_test.go
++++ b/pkg/sriov/sriov_test.go
+@@ -3,13 +3,13 @@ package sriov
+ import (
+ 	"net"
+ 
+-	"github.com/k8snetworkplumbingwg/sriov-cni/pkg/utils"
++	"github.com/MarvellEmbeddedProcessors/k8s-cni-offload/build/offload-cni/pkg/utils"
+ 
++	"github.com/MarvellEmbeddedProcessors/k8s-cni-offload/build/offload-cni/pkg/sriov/mocks"
++	sriovtypes "github.com/MarvellEmbeddedProcessors/k8s-cni-offload/build/offload-cni/pkg/types"
++	mocks_utils "github.com/MarvellEmbeddedProcessors/k8s-cni-offload/build/offload-cni/pkg/utils/mocks"
+ 	"github.com/containernetworking/plugins/pkg/ns"
+ 	"github.com/containernetworking/plugins/pkg/testutils"
+-	"github.com/k8snetworkplumbingwg/sriov-cni/pkg/sriov/mocks"
+-	sriovtypes "github.com/k8snetworkplumbingwg/sriov-cni/pkg/types"
+-	mocks_utils "github.com/k8snetworkplumbingwg/sriov-cni/pkg/utils/mocks"
+ 	. "github.com/onsi/ginkgo/v2"
+ 	. "github.com/onsi/gomega"
+ 	"github.com/stretchr/testify/mock"
+diff --git a/pkg/types/types.go b/pkg/types/types.go
+index 07b30f83..509204e3 100644
+--- a/pkg/types/types.go
++++ b/pkg/types/types.go
+@@ -58,6 +58,11 @@ type SriovNetConf struct {
+ 	VlanQoS       *int    `json:"vlanQoS"`
+ 	VlanProto     *string `json:"vlanProto"` // 802.1ad|802.1q
+ 	DeviceID      string  `json:"deviceID"`  // PCI address of a VF in valid sysfs format
++	VendorID      string  `json:"vendorID"`
++	ProductID     string  `json:"productID"`
++	HostIPAM      bool    `json:"hostIPAM"`
++	NumPFs        int
++	PFID          int
+ 	VFID          int
+ 	MinTxRate     *int   `json:"min_tx_rate"`          // Mbps, 0 = disable rate limiting
+ 	MaxTxRate     *int   `json:"max_tx_rate"`          // Mbps, 0 = disable rate limiting
+diff --git a/pkg/utils/packet_test.go b/pkg/utils/packet_test.go
+index 0e9227c5..60508a45 100644
+--- a/pkg/utils/packet_test.go
++++ b/pkg/utils/packet_test.go
+@@ -4,7 +4,7 @@ import (
+ 	"sync/atomic"
+ 	"time"
+ 
+-	mocks_utils "github.com/k8snetworkplumbingwg/sriov-cni/pkg/utils/mocks"
++	mocks_utils "github.com/MarvellEmbeddedProcessors/k8s-cni-offload/build/offload-cni/pkg/utils/mocks"
+ 	. "github.com/onsi/ginkgo/v2"
+ 	. "github.com/onsi/gomega"
+ 	"github.com/stretchr/testify/mock"
+diff --git a/pkg/utils/pci_allocator.go b/pkg/utils/pci_allocator.go
+index 3bf6ff05..3ebebaea 100644
+--- a/pkg/utils/pci_allocator.go
++++ b/pkg/utils/pci_allocator.go
+@@ -5,8 +5,8 @@ import (
+ 	"os"
+ 	"path/filepath"
+ 
++	"github.com/MarvellEmbeddedProcessors/k8s-cni-offload/build/offload-cni/pkg/logging"
+ 	"github.com/containernetworking/plugins/pkg/ns"
+-	"github.com/k8snetworkplumbingwg/sriov-cni/pkg/logging"
+ )
+ 
+ type PCIAllocation interface {
+@@ -90,3 +90,23 @@ func (p *PCIAllocator) IsAllocated(pciAddress string) (bool, error) {
+ 	networkNamespace.Close()
+ 	return true, nil
+ }
++
++func LinknameByPci(addrs string) string {
++	var (
++		root string
++		err  error
++	)
++
++	root = "/sys/bus/pci/devices/" + addrs + "/net"
++	entries, err := os.ReadDir(root)
++	if err != nil {
++		panic(err)
++	}
++
++	for _, e := range entries {
++		//fmt.Println(e.Name())
++		return e.Name()
++	}
++
++	return ""
++}
+diff --git a/pkg/utils/utils.go b/pkg/utils/utils.go
+index 3a64a422..13bc44b6 100644
+--- a/pkg/utils/utils.go
++++ b/pkg/utils/utils.go
+@@ -11,7 +11,7 @@ import (
+ 	"strings"
+ 	"time"
+ 
+-	sriovtypes "github.com/k8snetworkplumbingwg/sriov-cni/pkg/types"
++	sriovtypes "github.com/MarvellEmbeddedProcessors/k8s-cni-offload/build/offload-cni/pkg/types"
+ )
+ 
+ var (
+diff --git a/pkg/utils/utils_test.go b/pkg/utils/utils_test.go
+index bcd891aa..d30ed249 100644
+--- a/pkg/utils/utils_test.go
++++ b/pkg/utils/utils_test.go
+@@ -15,8 +15,8 @@ import (
+ 
+ 	cnitypes "github.com/containernetworking/cni/pkg/types"
+ 
+-	sriovtypes "github.com/k8snetworkplumbingwg/sriov-cni/pkg/types"
+-	mocks_utils "github.com/k8snetworkplumbingwg/sriov-cni/pkg/utils/mocks"
++	sriovtypes "github.com/MarvellEmbeddedProcessors/k8s-cni-offload/build/offload-cni/pkg/types"
++	mocks_utils "github.com/MarvellEmbeddedProcessors/k8s-cni-offload/build/offload-cni/pkg/utils/mocks"
+ )
+ 
+ var _ = Describe("Utils", func() {
+-- 
+2.25.1
+

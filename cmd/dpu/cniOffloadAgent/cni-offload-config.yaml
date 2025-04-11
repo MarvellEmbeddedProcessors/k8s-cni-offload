@@ -1,0 +1,3 @@
+serverPort: ":8000"
+#Supported vendorPluginName: "Marvell", "debug"
+vendorPluginName: "Marvell"

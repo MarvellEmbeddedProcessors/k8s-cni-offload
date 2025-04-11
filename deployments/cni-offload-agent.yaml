@@ -1,0 +1,47 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: cni-offload-agent
+  namespace: kube-system
+spec:
+  selector:
+    matchLabels:
+      app: cni-offload-agent
+  template:
+    metadata:
+      labels:
+        app: cni-offload-agent
+        component: network
+        type: infra
+    spec:
+      hostNetwork: true
+      hostPID: true
+      nodeSelector:
+        kubernetes.io/arch: "arm64"
+      containers:
+        - name: cni-offload-agent
+          image: {{.Repository}}/cni-offload-agent
+          command: [ "/bin/bash", "-c", "--" ]
+          args: [ "/start-cniOffloadAgent.sh" ]
+          securityContext:
+            privileged: true
+          imagePullPolicy: Always 
+          volumeMounts:
+            - name: cilium-mount
+              mountPath: /var/run/cilium/
+              mountPropagation: Bidirectional
+            - name: pciids
+              mountPath: /usr/share/misc/
+            - name: host-root
+              mountPath: /host
+              mountPropagation: Bidirectional
+      volumes:
+        - name: cilium-mount
+          hostPath:
+            path: /var/run/cilium/
+        - name: pciids
+          hostPath:
+            path: /usr/share/misc/
+        - name: host-root
+          hostPath:
+            path: /

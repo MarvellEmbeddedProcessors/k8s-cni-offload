@@ -1,0 +1,4 @@
+# Supported cniLayers: "Offload Cilium CNI", "Offload Debug CNI"
+cniLayer: "Offload Cilium CNI"
+logLevel:  "debug"
+logFile: "/var/run/cni-offload-agent.log"

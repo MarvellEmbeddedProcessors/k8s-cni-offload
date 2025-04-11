@@ -1,0 +1,49 @@
+syntax = "proto3";
+option go_package = "pb/cniOffload";
+
+message IntfDetails {
+ string name = 1;
+ uint32 vfid = 2;
+ uint32 pfid =3 ;
+ uint32 num_pfs = 4;
+
+}
+
+/*
+PodDetails of host side Pod for which the add request is generated. These
+details are needed if the DPU is handling offloading of a CNI.
+*/
+message PodDetails {
+  string pod_namespace = 1;
+  string pod_name = 2;
+  string containerId=3;
+}
+
+
+/*
+IpDetails IP address of the interface on the host pod side details. To be used
+on both directions as per configuration.
+*/
+message IpDetails {
+  string version=1;
+  string address=2;
+  string gateway=3;
+  string dns=4;
+}
+
+/*
+IPAMallocatedbyHost Field to specify if IPAM is on host or on DPU. If on host
+the details of IP allocation will be sent in the IPdetails field from host to
+DPU. If false the IP details will be sent from DPU to host in result
+*/
+message IPAMallocatedbyHost {
+
+  bool ipamAllocatedbyHost = 1;
+}
+
+/*
+OffloadFlags SmartNIC offloads that should be enabled on the mapped interface.
+*/
+message OffloadFlags {
+ bool  CheckSumOffload =1;
+}

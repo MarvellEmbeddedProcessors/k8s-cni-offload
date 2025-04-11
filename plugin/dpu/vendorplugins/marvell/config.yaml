@@ -1,0 +1,6 @@
+#dpdkPath: "false"
+#ciliumCNIPath: "false"
+#cniBinary: "Offload Cilium CNI"
+cniBinary: "Offload Debug CNI"
+logLevel:  "debug"
+logFile: "/var/run/dpu-agent.log"

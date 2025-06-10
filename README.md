@@ -1,6 +1,3 @@
-..  SPDX-License-Identifier: Marvell-MIT
-    Copyright (c) 2025 Marvell.
-
 # Kubernetes CNI Offload
 
 ## Introduction
@@ -240,23 +237,7 @@ To test services and policies for the offloaded solution, we used the standard C
 
 ### Testbed Diagram:
 
-![TestBed diagram](deployments/images/cni-offload-testbed1.png)
-
-```bash
-# Pods shown in the diagram
-Test pod 1 - Xwing (XW)
-Test pod 2 - Tiefighter (TF)
-Service pods - Deathstar (DS)
-Cilium Agent pod CA
-```
-
-```bash
-# Nodes shown in the diagram
-master node - hyd1413
-worker 1 - host-1
-worker 2 - hyd11152
-worker 3 - hyd11153
-```
+![TestBed diagram](deployments/images/cni-offload-testbed-diagram.png)
 
 ```kubectl get node ```
 
@@ -348,5 +329,4 @@ This demo showcases the following aspects of this PoC
 2. Pod traffic encryption is handled in DPU
 ```
 
-.. raw:: html
-  :file: ../_static/demo/cni_offload_ipsec.html
+
